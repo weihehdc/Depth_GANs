@@ -2,12 +2,15 @@
 --
 -- code derived from https://github.com/soumith/dcgan.torch
 --
-
+require 'torch'
 require 'image'
+require 'optim'
 require 'nn'
 require 'nngraph'
 util = paths.dofile('util/util.lua')
 torch.setdefaulttensortype('torch.FloatTensor')
+require 'models'
+require 'distributions'
 
 opt = {
     DATA_ROOT = '',           -- path to images (should have subfolders 'train', 'val', etc)
@@ -32,6 +35,11 @@ opt = {
     checkpoints_dir = './checkpoints', -- loads models from here
     results_dir='./results/',          -- saves results here
     which_epoch = 'latest',            -- which epoch to test? set to 'latest' to use latest cached model
+    lr = 0.0002,            -- initial learning rate for adam
+    beta1 = 0.5,            -- momentum term of adam
+    condition_GAN = 1,
+    lambda = 1000,
+    use_GAN = 1
 }
 
 
@@ -41,12 +49,28 @@ opt.nThreads = 1 -- test only works with 1 thread...
 print(opt)
 if opt.display == 0 then opt.display = false end
 
+local real_label = 1
+local fake_label = 0
+
+-- Criterias for the networks
+local criterion = nn.BCECriterion()
+local criterionAE = nn.AbsCriterion()
+
+optimStateG = {
+   -- learning rate of the optimizer
+   learningRate = opt.lr,
+   -- momentum of the adam optimizer
+   beta1 = opt.beta1,
+}
+
 opt.manualSeed = torch.random(1, 10000) -- set seed
 print("Random Seed: " .. opt.manualSeed)
 torch.manualSeed(opt.manualSeed)
 torch.setdefaulttensortype('torch.FloatTensor')
 
 opt.netG_name = opt.name .. '/' .. opt.which_epoch .. '_net_G'
+opt.netD_name = opt.name .. '/' .. opt.which_epoch .. '_net_D'
+
 
 local data_loader = paths.dofile('data/data.lua')
 print('#threads...' .. opt.nThreads)
@@ -56,6 +80,7 @@ print("Dataset Size: ", data:size())
 -- translation direction
 local idx_A = nil
 local idx_B = nil
+local errG = 0
 local input_nc = opt.input_nc
 local output_nc = opt.output_nc
 if opt.which_direction=='AtoB' then
@@ -71,11 +96,13 @@ end
 
 local input = torch.FloatTensor(opt.batchSize,3,opt.fineSize,opt.fineSize)
 local target = torch.FloatTensor(opt.batchSize,3,opt.fineSize,opt.fineSize)
+local Generator_out = torch.FloatTensor(opt.batchSize,3,opt.fineSize,opt.fineSize)
+local fake_AB = torch.Tensor(opt.batchSize, output_nc + input_nc*opt.condition_GAN, opt.fineSize, opt.fineSize)
 
 print('checkpoints_dir', opt.checkpoints_dir)
 local netG = util.load(paths.concat(opt.checkpoints_dir, opt.netG_name .. '.t7'), opt)
---netG:evaluate()
-
+local netD = util.load(paths.concat(opt.checkpoints_dir, opt.netD_name .. '.t7'), opt)
+local parametersG, gradParametersG = netG:getParameters()
 print(netG)
 
 
@@ -86,12 +113,76 @@ function TableConcat(t1,t2)
     return t1
 end
 
+
+if opt.gpu > 0 then
+   print('transferring to gpu...')
+   require 'cunn'
+   cutorch.setDevice(opt.gpu)
+   input = input:cuda();
+   target = target:cuda(); Generator_out = Generator_out:cuda(); 
+   fake_AB = fake_AB:cuda();
+   if opt.cudnn==1 then
+      netG = util.cudnn(netG); netD = util.cudnn(netD);
+   end
+   netD:cuda(); netG:cuda(); criterion:cuda(); criterionAE:cuda();
+   print('done')
+else
+    print('running model on CPU')
+end
+
+-- create closure to evaluate f(X) and df/dX of generator
+local fGx = function(x)
+    netD:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+    netG:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+    
+    gradParametersG:zero()
+    
+    -- GAN loss
+    local df_dg = torch.zeros(Generator_out:size())
+    if opt.gpu>0 then 
+        df_dg = df_dg:cuda();
+    end
+    
+    if opt.use_GAN==1 then
+       local output = netD:forward(fake_AB)
+       local label = torch.FloatTensor(output:size()):fill(real_label) -- fake labels are real for generator cost as we need to minimize the cost  when output-label is done
+       if opt.gpu>0 then 
+        label = label:cuda();
+       end
+       errG = criterion:forward(output, label)
+       
+       local df_do = criterion:backward(output, label) -- grad wrt the output of the networks
+       df_dg = netD:updateGradInput(fake_AB, df_do):narrow(2,fake_AB:size(2)-output_nc+1, output_nc) -- update the gradients wrt the input
+    else
+        errG = 0
+    end
+    
+    -- unary loss
+    local df_do_AE = torch.zeros(Generator_out:size())
+    if opt.gpu>0 then 
+        df_do_AE = df_do_AE:cuda();
+    end
+    if opt.use_L1==1 then
+       errL1 = criterionAE:forward(Generator_out, target)
+       df_do_AE = criterionAE:backward(Generator_out, target)
+    else
+        errL1 = 0
+    end
+    
+    netG:backward(input, df_dg + df_do_AE:mul(opt.lambda))
+    
+    return errG, gradParametersG
+end
+
+
+
 if opt.how_many=='all' then
     opt.how_many=data:size()
 end
 opt.how_many=math.min(opt.how_many, data:size())
 
 local filepaths = {} -- paths to images tested on
+local errors = {}
 for n=1,math.floor(opt.how_many/opt.batchSize) do
     print('processing batch ' .. n)
     
@@ -101,20 +192,44 @@ for n=1,math.floor(opt.how_many/opt.batchSize) do
     
     input = data_curr[{ {}, idx_A, {}, {} }]
     target = data_curr[{ {}, idx_B, {}, {} }]
+    -- Generator_out = netG:forward(input)
+    
     
     if opt.gpu > 0 then
         input = input:cuda()
     end
+    mu = torch.zeros(256)
+    sigma = 10000*torch.eye(256)
+    -- (1,3,256,256)
+
+    sample = torch.zeros(1,3,256,1)
+
+    sample_1 = distributions.mvn.rnd(mu, sigma) -- a 
+    sample_2 = distributions.mvn.rnd(mu, sigma) -- a 
+    sample_3 = distributions.mvn.rnd(mu, sigma) -- a 
+    sample[{1,1,{1,256},1}] = sample_1
+    sample[{1,2,{1,256},1}] = sample_2
+    sample[{1,3,{1,256},1}] = sample_3
+    sample = sample:cuda();
+    input_noisy = torch.cat(input,sample,4)
+    -- print(real_A:size())
+    -- print(sample:size())
+    -- created fake using real_A as input
     
+    -- print(input:size())
     if opt.preprocess == 'colorization' then
-       local output_AB = netG:forward(input):float()
+       local output_AB = netG:forward(input_noisy):float()
        local input_L = input:float() 
        output = util.deprocessLAB_batch(input_L, output_AB)
        local target_AB = target:float()
        target = util.deprocessLAB_batch(input_L, target_AB)
        input = util.deprocessL_batch(input_L)
     else 
-        output = util.deprocess_batch(netG:forward(input))
+        Generator_out = netG:forward(input_noisy)
+        fake_AB = torch.cat(input,Generator_out,2)
+        -- optim.adam(fGx, parametersG, optimStateG)
+        
+        output = util.deprocess_batch(Generator_out)
         input = util.deprocess_batch(input):float()
         output = output:float()
         target = util.deprocess_batch(target):float()
@@ -147,6 +262,9 @@ for n=1,math.floor(opt.how_many/opt.batchSize) do
     end
     
     filepaths = TableConcat(filepaths, filepaths_curr)
+    errors[#errors+1] = errG
+
+    print(('Err_G: %.4f' ):format(errG))
 end
 
 -- make webpage
@@ -158,6 +276,7 @@ io.write('<tr><td>Image #</td><td>Input</td><td>Output</td><td>Ground Truth</td>
 for i=1, #filepaths do
     io.write('<tr>')
     io.write('<td>' .. filepaths[i] .. '</td>')
+    io.write('<td>' .. errors[i] .. '</td>')
     io.write('<td><img src="./images/input/' .. filepaths[i] .. '"/></td>')
     io.write('<td><img src="./images/output/' .. filepaths[i] .. '"/></td>')
     io.write('<td><img src="./images/target/' .. filepaths[i] .. '"/></td>')
